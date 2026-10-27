@@ -1,0 +1,221 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:gal/gal.dart';
+import 'package:path_provider/path_provider.dart';
+
+void main() => runApp(const MyApp());
+
+const int kPort = 8080;
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        title: 'WiFi Video Share',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true),
+        home: const HomePage(),
+      );
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  HttpServer? _server;
+  String _myIp = '';
+  final List<String> _log = [];
+  final _ipCtrl = TextEditingController();
+  double _progress = 0;
+  String _status = '';
+  bool _sending = false;
+
+  Future<String> _findIp() async {
+    final ifaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4, includeLoopback: false);
+    for (final i in ifaces) {
+      for (final a in i.addresses) {
+        if (a.address.startsWith('192.') ||
+            a.address.startsWith('10.') ||
+            a.address.startsWith('172.')) {
+          return a.address;
+        }
+      }
+    }
+    return ifaces.isNotEmpty ? ifaces.first.addresses.first.address : '';
+  }
+
+  Future<void> _startReceive() async {
+    if (_server != null) return;
+    await Gal.requestAccess();
+    final ip = await _findIp();
+    final server = await HttpServer.bind(InternetAddress.anyIPv4, kPort);
+    setState(() {
+      _server = server;
+      _myIp = ip;
+      _log.insert(0, 'Receiver chalu. Opekkha korchi...');
+    });
+    server.listen((req) async {
+      if (req.method == 'PUT' && req.uri.path == '/upload') {
+        try {
+          var name = Uri.decodeComponent(
+              req.headers.value('x-filename') ?? 'video.mp4');
+          name = name.split('/').last.split('\\').last;
+          final dir = await getTemporaryDirectory();
+          final f = File('${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name');
+          final sink = f.openWrite();
+          await sink.addStream(req);
+          await sink.close();
+          await Gal.putVideo(f.path);
+          await f.delete();
+          req.response.statusCode = 200;
+          await req.response.close();
+          if (mounted) setState(() => _log.insert(0, '✅ Received: $name'));
+        } catch (e) {
+          req.response.statusCode = 500;
+          await req.response.close();
+          if (mounted) setState(() => _log.insert(0, '❌ Error: $e'));
+        }
+      } else {
+        req.response.statusCode = 404;
+        await req.response.close();
+      }
+    });
+  }
+
+  Future<void> _stopReceive() async {
+    await _server?.close(force: true);
+    setState(() {
+      _server = null;
+      _log.insert(0, 'Receiver bondho.');
+    });
+  }
+
+  Future<void> _send() async {
+    final ip = _ipCtrl.text.trim();
+    if (ip.isEmpty) {
+      setState(() => _status = 'Age receiver er IP dao.');
+      return;
+    }
+    final result =
+        await FilePicker.platform.pickFiles(type: FileType.video, allowMultiple: true);
+    if (result == null) return;
+    setState(() {
+      _sending = true;
+      _progress = 0;
+    });
+    try {
+      for (var i = 0; i < result.files.length; i++) {
+        final pf = result.files[i];
+        if (pf.path == null) continue;
+        final file = File(pf.path!);
+        final total = await file.length();
+        var sent = 0;
+        var lastPct = -1;
+        setState(() => _status = 'Sending ${i + 1}/${result.files.length}: ${pf.name}');
+        final client = HttpClient();
+        final req = await client.putUrl(Uri.parse('http://$ip:$kPort/upload'));
+        req.headers.set('x-filename', Uri.encodeComponent(pf.name));
+        req.contentLength = total;
+        await req.addStream(file.openRead().map((chunk) {
+          sent += chunk.length;
+          final pct = (sent * 100 ~/ total);
+          if (pct != lastPct && mounted) {
+            lastPct = pct;
+            setState(() => _progress = sent / total);
+          }
+          return chunk;
+        }));
+        final resp = await req.close();
+        client.close();
+        if (resp.statusCode != 200) throw 'Server error ${resp.statusCode}';
+      }
+      setState(() => _status = '✅ Send hoye geche!');
+    } catch (e) {
+      setState(() => _status = '❌ Error: $e');
+    } finally {
+      setState(() => _sending = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _server?.close(force: true);
+    _ipCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('WiFi Video Share'),
+          bottom: const TabBar(tabs: [
+            Tab(icon: Icon(Icons.upload), text: 'Send'),
+            Tab(icon: Icon(Icons.download), text: 'Receive'),
+          ]),
+        ),
+        body: TabBarView(children: [_sendTab(), _receiveTab()]),
+      ),
+    );
+  }
+
+  Widget _sendTab() => Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(children: [
+          const Text('Receiver phone e Receive tab e jei IP dekhabe seta likho:'),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _ipCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+                border: OutlineInputBorder(), labelText: 'Receiver IP (e.g. 192.168.0.105)'),
+          ),
+          const SizedBox(height: 16),
+          FilledButton.icon(
+            onPressed: _sending ? null : _send,
+            icon: const Icon(Icons.video_library),
+            label: const Text('Video select kore Send koro'),
+          ),
+          const SizedBox(height: 20),
+          if (_sending) LinearProgressIndicator(value: _progress),
+          const SizedBox(height: 10),
+          Text(_status),
+        ]),
+      );
+
+  Widget _receiveTab() => Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(children: [
+          if (_server == null)
+            FilledButton.icon(
+              onPressed: _startReceive,
+              icon: const Icon(Icons.wifi),
+              label: const Text('Receive chalu koro'),
+            )
+          else ...[
+            const Text('Onno phone e ai IP dao:'),
+            const SizedBox(height: 8),
+            SelectableText(_myIp,
+                style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            const Text('Ai screen khola rakho jotokkhon transfer hocche.',
+                textAlign: TextAlign.center),
+            const SizedBox(height: 12),
+            OutlinedButton(onPressed: _stopReceive, child: const Text('Bondho koro')),
+          ],
+          const Divider(height: 30),
+          Expanded(
+            child: ListView(children: _log.map((l) => ListTile(dense: true, title: Text(l))).toList()),
+          ),
+        ]),
+      );
+}
